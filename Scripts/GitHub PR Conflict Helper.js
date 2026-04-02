@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitHub PR Conflicts Helper
 // @namespace    https://github.com/KrX3D
-// @version      2.0.0
-// @description  Helper for GitHub PR conflict pages: accept current/incoming for all conflicts in current file, internal live counter, auto-default after 30s, Alt+N next, Alt+B prev.
+// @version      2.1.0
+// @description  Helper for GitHub PR conflict pages: accept current/incoming for all conflicts in current file, internal live counter, auto-default after 30s, Alt+N next, Alt+B prev, auto mark resolved, auto commit merge.
 // @match        https://github.com/*
 // @run-at       document-idle
 // @grant        none
@@ -31,6 +31,8 @@
     let statusEl = null;
     let fileStatusEl = null;
     let countdownEl = null;
+    let autoMarkResolvedCheckbox = null;
+    let autoCommitCheckbox = null;
 
     let autoTimer = null;
     let autoDeadline = null;
@@ -47,6 +49,14 @@
 
     let internalRemaining = null;
     let lastSeenInitialCount = null;
+
+    let autoMarkResolvedEnabled = true;
+    let autoCommitEnabled = true;
+
+    let autoMarkResolvedInProgress = false;
+    let autoCommitInProgress = false;
+    let lastAutoMarkResolvedKey = '';
+    let lastAutoCommitKey = '';
 
     const pendingWidgets = new WeakSet();
     const resolvedWidgets = new WeakSet();
@@ -75,8 +85,28 @@
         return rect.width > 0 && rect.height > 0;
     }
 
+    function scrollElementIntoHelpfulView(el) {
+        if (!el || !el.isConnected) return;
+        try {
+            el.scrollIntoView({
+                block: 'center',
+                inline: 'nearest',
+                behavior: 'instant'
+            });
+        } catch {
+            try {
+                el.scrollIntoView({
+                    block: 'center',
+                    inline: 'nearest'
+                });
+            } catch {}
+        }
+    }
+
     function triggerRealClick(el) {
         if (!el || !el.isConnected) return false;
+
+        scrollElementIntoHelpfulView(el);
 
         try {
             el.click();
@@ -128,7 +158,7 @@
 
     function setInternalRemaining(n) {
         const newValue = Math.max(0, Number.isFinite(n) ? n : 0);
-        if (internalRemaining === newValue) return; // critical: avoid observer loop
+        if (internalRemaining === newValue) return;
         internalRemaining = newValue;
         updateDisplayedCountNow();
         log('setInternalRemaining', internalRemaining);
@@ -244,6 +274,11 @@
         return `${location.pathname}|${filename}|${initial}|${markResolvedEnabled}`;
     }
 
+    function getAutoActionKey() {
+        const filename = document.querySelector('.js-filename')?.textContent?.trim() || '';
+        return `${location.pathname}|${filename}`;
+    }
+
     async function monitorWidgetResolution(widget) {
         if (!widget || resolvedWidgets.has(widget) || pendingWidgets.has(widget)) {
             return false;
@@ -291,6 +326,63 @@
         }
     }
 
+    async function autoClickMarkResolvedIfWanted() {
+        if (!autoMarkResolvedEnabled || autoMarkResolvedInProgress) return false;
+        if (!isConflictPage()) return false;
+        if (bulkActionRunning) return false;
+
+        const btn = getMarkResolvedButton();
+        if (!btn || !isMarkResolvedEnabled()) return false;
+
+        const key = getAutoActionKey();
+        if (lastAutoMarkResolvedKey === key) return false;
+
+        autoMarkResolvedInProgress = true;
+        lastAutoMarkResolvedKey = key;
+
+        try {
+            setStatus('Auto-clicking Mark as resolved…');
+            const ok = triggerRealClick(btn);
+            if (ok) {
+                await wait(250);
+                queueRefresh();
+                setTimeout(queueRefresh, 700);
+                return true;
+            }
+            return false;
+        } finally {
+            autoMarkResolvedInProgress = false;
+        }
+    }
+
+    async function autoClickCommitMergeIfWanted() {
+        if (!autoCommitEnabled || autoCommitInProgress) return false;
+        if (!isConflictPage()) return false;
+
+        const btn = getCommitMergeButton();
+        if (!btn || !isVisible(btn)) return false;
+
+        const key = `${location.pathname}|commit`;
+        if (lastAutoCommitKey === key) return false;
+
+        autoCommitInProgress = true;
+        lastAutoCommitKey = key;
+
+        try {
+            setStatus('Auto-clicking Commit merge…');
+            const ok = triggerRealClick(btn);
+            if (ok) {
+                await wait(250);
+                queueRefresh();
+                setTimeout(queueRefresh, 700);
+                return true;
+            }
+            return false;
+        } finally {
+            autoCommitInProgress = false;
+        }
+    }
+
     function injectStyles() {
         if (document.getElementById(STYLE_ID)) return;
 
@@ -302,7 +394,7 @@
                 right: 16px;
                 bottom: 16px;
                 z-index: 999999;
-                width: 320px;
+                width: 360px;
                 background: #0d1117;
                 color: #e6edf3;
                 border: 1px solid #30363d;
@@ -333,6 +425,22 @@
                 gap: 6px;
                 flex-wrap: wrap;
                 margin-top: 8px;
+            }
+            #${PANEL_ID} .krx-options {
+                margin-top: 8px;
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+            }
+            #${PANEL_ID} .krx-option {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                color: #e6edf3;
+            }
+            #${PANEL_ID} .krx-option input[type="checkbox"] {
+                margin: 0;
+                cursor: pointer;
             }
             #${PANEL_ID} button {
                 appearance: none;
@@ -391,6 +499,16 @@
                 <button class="krx-secondary krx-accept-incoming">Accept incoming</button>
                 <button class="krx-dismiss">Dismiss</button>
             </div>
+            <div class="krx-options">
+                <label class="krx-option">
+                    <input type="checkbox" class="krx-auto-mark-resolved" checked>
+                    <span>Auto-click Mark as resolved</span>
+                </label>
+                <label class="krx-option">
+                    <input type="checkbox" class="krx-auto-commit" checked>
+                    <span>Auto-click Commit merge</span>
+                </label>
+            </div>
             <div class="krx-footer">
                 Alt+N = Next conflict · Alt+B = Previous conflict
             </div>
@@ -402,6 +520,19 @@
         countdownEl = panel.querySelector('.krx-countdown');
         statusEl = panel.querySelector('.krx-status');
         fileStatusEl = panel.querySelector('.krx-file-status');
+        autoMarkResolvedCheckbox = panel.querySelector('.krx-auto-mark-resolved');
+        autoCommitCheckbox = panel.querySelector('.krx-auto-commit');
+
+        autoMarkResolvedCheckbox.checked = autoMarkResolvedEnabled;
+        autoCommitCheckbox.checked = autoCommitEnabled;
+
+        autoMarkResolvedCheckbox.addEventListener('change', () => {
+            autoMarkResolvedEnabled = !!autoMarkResolvedCheckbox.checked;
+        });
+
+        autoCommitCheckbox.addEventListener('change', () => {
+            autoCommitEnabled = !!autoCommitCheckbox.checked;
+        });
 
         panel.querySelector('.krx-accept-current').addEventListener('click', () => acceptAll('current', false));
         panel.querySelector('.krx-accept-incoming').addEventListener('click', () => acceptAll('incoming', false));
@@ -486,10 +617,14 @@
         if (!widgets.length) return { clicked: false, resolved: false };
 
         const widget = widgets[0];
+        scrollElementIntoHelpfulView(widget);
+
         const buttons = getWidgetButtons(widget);
         const target = mode === 'incoming' ? buttons.incoming : buttons.current;
 
         if (!target) return { clicked: false, resolved: false };
+
+        scrollElementIntoHelpfulView(target);
 
         const ok = triggerRealClick(target);
         if (!ok) return { clicked: false, resolved: false };
@@ -593,7 +728,6 @@
             setInternalRemaining(0);
             setStatus('This file is ready.');
             setFileStatus('Mark as resolved is enabled.');
-            if (panel) panel.style.display = 'none';
             queueRefresh();
             return;
         }
@@ -648,7 +782,7 @@
         refreshTimer = setTimeout(refreshUI, 120);
     }
 
-    function refreshUI() {
+    async function refreshUI() {
         if (!isConflictPage()) {
             stopAutoTimer();
             disconnectObserver();
@@ -657,6 +791,10 @@
             lastSeenInitialCount = null;
             bulkActionRunning = false;
             bulkCancelRequested = false;
+            autoMarkResolvedInProgress = false;
+            autoCommitInProgress = false;
+            lastAutoMarkResolvedKey = '';
+            lastAutoCommitKey = '';
             return;
         }
 
@@ -672,6 +810,7 @@
             stopAutoTimer();
             bulkActionRunning = false;
             bulkCancelRequested = false;
+            autoMarkResolvedInProgress = false;
         }
 
         const remaining = getRemainingConflictCount();
@@ -692,12 +831,14 @@
         if (commitMergeBtn && isVisible(commitMergeBtn)) {
             stopAutoTimer();
             if (panel) panel.style.display = 'none';
+            await autoClickCommitMergeIfWanted();
             return;
         }
 
         if (markResolvedEnabled) {
             stopAutoTimer();
             if (panel) panel.style.display = 'none';
+            await autoClickMarkResolvedIfWanted();
             return;
         }
 
@@ -782,6 +923,10 @@
                 lastSeenInitialCount = null;
                 bulkActionRunning = false;
                 bulkCancelRequested = false;
+                autoMarkResolvedInProgress = false;
+                autoCommitInProgress = false;
+                lastAutoMarkResolvedKey = '';
+                lastAutoCommitKey = '';
                 disconnectObserver();
                 queueRefresh();
                 setTimeout(queueRefresh, 300);
