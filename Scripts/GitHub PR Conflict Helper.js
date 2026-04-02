@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitHub PR Conflicts Helper
 // @namespace    https://github.com/KrX3D
-// @version      2.1.0
-// @description  Helper for GitHub PR conflict pages: accept current/incoming for all conflicts in current file, internal live counter, auto-default after 30s, Alt+N next, Alt+B prev, auto mark resolved, auto commit merge.
+// @version      2.5.0
+// @description  Helper for GitHub PR conflict pages: accept current/incoming for all conflicts in current file, internal live counter, auto-default after 30s, Alt+N next, Alt+B prev, auto mark resolved, auto commit merge, auto continue same choice on next file.
 // @match        https://github.com/*
 // @run-at       document-idle
 // @grant        none
@@ -18,7 +18,8 @@
     const AUTO_SECONDS = 30;
     const CLICK_DELAY_MS = 120;
     const LOOP_DELAY_MS = 220;
-    const MAX_BULK_STEPS = 500;
+    const MAX_BULK_STEPS = 900;
+    const LARGE_CONFLICT_SCAN_STEPS = 4;   // how many times to try moving backward when a long conflict gets skipped
 
     // =========================
     // Constants
@@ -33,6 +34,7 @@
     let countdownEl = null;
     let autoMarkResolvedCheckbox = null;
     let autoCommitCheckbox = null;
+    let autoContinueCheckbox = null;
 
     let autoTimer = null;
     let autoDeadline = null;
@@ -52,11 +54,17 @@
 
     let autoMarkResolvedEnabled = true;
     let autoCommitEnabled = true;
+    let autoContinueEnabled = true;
 
     let autoMarkResolvedInProgress = false;
     let autoCommitInProgress = false;
+    let autoContinueInProgress = false;
     let lastAutoMarkResolvedKey = '';
     let lastAutoCommitKey = '';
+    let lastAutoContinueKey = '';
+
+    let lastPickedMode = null;     // 'current' | 'incoming' | null
+    let hasPickedMode = false;     // prevents auto-continue from starting immediately on first page load
 
     const pendingWidgets = new WeakSet();
     const resolvedWidgets = new WeakSet();
@@ -85,20 +93,78 @@
         return rect.width > 0 && rect.height > 0;
     }
 
-    function scrollElementIntoHelpfulView(el) {
+    function getCodeMirrorScroll() {
+        return document.querySelector('.CodeMirror-scroll');
+    }
+
+    function rememberPickedMode(mode) {
+        if (mode === 'current' || mode === 'incoming') {
+            lastPickedMode = mode;
+            hasPickedMode = true;
+            log('rememberPickedMode', mode);
+        }
+    }
+
+    function scrollButtonFullyIntoEditorView(el) {
         if (!el || !el.isConnected) return;
+
+        const cmScroll = getCodeMirrorScroll();
+        if (!cmScroll) {
+            try {
+                el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+            } catch {
+                try {
+                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                } catch {}
+            }
+            return;
+        }
+
         try {
-            el.scrollIntoView({
-                block: 'center',
-                inline: 'nearest',
-                behavior: 'instant'
-            });
+            const btnRect = el.getBoundingClientRect();
+            const scRect = cmScroll.getBoundingClientRect();
+
+            const marginTop = 20;
+            const marginBottom = 20;
+
+            let delta = 0;
+
+            if (btnRect.top < scRect.top + marginTop) {
+                delta = btnRect.top - (scRect.top + marginTop);
+            } else if (btnRect.bottom > scRect.bottom - marginBottom) {
+                delta = btnRect.bottom - (scRect.bottom - marginBottom);
+            }
+
+            if (delta !== 0) {
+                cmScroll.scrollTop += delta;
+            }
+        } catch {}
+
+        try {
+            const btnRect2 = el.getBoundingClientRect();
+            if (btnRect2.top < 0 || btnRect2.bottom > window.innerHeight) {
+                el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+            }
+        } catch {}
+    }
+
+    function bringWidgetHeaderIntoView(widget) {
+        if (!widget || !widget.isConnected) return;
+
+        const currentBtn = [...widget.querySelectorAll('button')]
+            .find(btn => normalizeText(btn.textContent) === 'accept current change')
+            || widget.querySelector('button');
+
+        if (currentBtn) {
+            scrollButtonFullyIntoEditorView(currentBtn);
+            return;
+        }
+
+        try {
+            widget.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'instant' });
         } catch {
             try {
-                el.scrollIntoView({
-                    block: 'center',
-                    inline: 'nearest'
-                });
+                widget.scrollIntoView({ block: 'start', inline: 'nearest' });
             } catch {}
         }
     }
@@ -106,7 +172,7 @@
     function triggerRealClick(el) {
         if (!el || !el.isConnected) return false;
 
-        scrollElementIntoHelpfulView(el);
+        scrollButtonFullyIntoEditorView(el);
 
         try {
             el.click();
@@ -383,6 +449,34 @@
         }
     }
 
+    async function autoContinueSameChoiceIfWanted() {
+        if (!autoContinueEnabled || autoContinueInProgress) return false;
+        if (!hasPickedMode || !lastPickedMode) return false;
+        if (!isConflictPage()) return false;
+        if (bulkActionRunning) return false;
+        if (dismissedForCurrentFile) return false;
+        if (isMarkResolvedEnabled()) return false;
+        if (getCommitMergeButton() && isVisible(getCommitMergeButton())) return false;
+
+        const remaining = getRemainingConflictCount();
+        if (remaining <= 0) return false;
+
+        const key = getAutoActionKey();
+        if (lastAutoContinueKey === key) return false;
+
+        autoContinueInProgress = true;
+        lastAutoContinueKey = key;
+
+        try {
+            setStatus(`Auto-continuing with ${lastPickedMode} on next file…`);
+            await wait(150);
+            acceptAll(lastPickedMode, false);
+            return true;
+        } finally {
+            autoContinueInProgress = false;
+        }
+    }
+
     function injectStyles() {
         if (document.getElementById(STYLE_ID)) return;
 
@@ -394,7 +488,7 @@
                 right: 16px;
                 bottom: 16px;
                 z-index: 999999;
-                width: 360px;
+                width: 390px;
                 background: #0d1117;
                 color: #e6edf3;
                 border: 1px solid #30363d;
@@ -508,6 +602,10 @@
                     <input type="checkbox" class="krx-auto-commit" checked>
                     <span>Auto-click Commit merge</span>
                 </label>
+                <label class="krx-option">
+                    <input type="checkbox" class="krx-auto-continue" checked>
+                    <span>Auto-continue same choice on next file</span>
+                </label>
             </div>
             <div class="krx-footer">
                 Alt+N = Next conflict · Alt+B = Previous conflict
@@ -522,9 +620,11 @@
         fileStatusEl = panel.querySelector('.krx-file-status');
         autoMarkResolvedCheckbox = panel.querySelector('.krx-auto-mark-resolved');
         autoCommitCheckbox = panel.querySelector('.krx-auto-commit');
+        autoContinueCheckbox = panel.querySelector('.krx-auto-continue');
 
         autoMarkResolvedCheckbox.checked = autoMarkResolvedEnabled;
         autoCommitCheckbox.checked = autoCommitEnabled;
+        autoContinueCheckbox.checked = autoContinueEnabled;
 
         autoMarkResolvedCheckbox.addEventListener('change', () => {
             autoMarkResolvedEnabled = !!autoMarkResolvedCheckbox.checked;
@@ -534,8 +634,18 @@
             autoCommitEnabled = !!autoCommitCheckbox.checked;
         });
 
-        panel.querySelector('.krx-accept-current').addEventListener('click', () => acceptAll('current', false));
-        panel.querySelector('.krx-accept-incoming').addEventListener('click', () => acceptAll('incoming', false));
+        autoContinueCheckbox.addEventListener('change', () => {
+            autoContinueEnabled = !!autoContinueCheckbox.checked;
+        });
+
+        panel.querySelector('.krx-accept-current').addEventListener('click', () => {
+            rememberPickedMode('current');
+            acceptAll('current', false);
+        });
+        panel.querySelector('.krx-accept-incoming').addEventListener('click', () => {
+            rememberPickedMode('incoming');
+            acceptAll('incoming', false);
+        });
         panel.querySelector('.krx-dismiss').addEventListener('click', () => {
             dismissedForCurrentFile = true;
             bulkCancelRequested = true;
@@ -592,6 +702,7 @@
             const ms = autoDeadline - Date.now();
             if (ms <= 0) {
                 stopAutoTimer();
+                rememberPickedMode('current');
                 acceptAll('current', true);
                 return;
             }
@@ -612,38 +723,101 @@
         return triggerRealClick(btn);
     }
 
+    async function recoverSkippedLargeConflict(mode) {
+        for (let i = 0; i < LARGE_CONFLICT_SCAN_STEPS; i++) {
+            const movedBack = await clickPrevConflict();
+            if (!movedBack) break;
+            await wait(120);
+
+            const widgets = getVisibleConflictWidgets();
+            if (!widgets.length) continue;
+
+            const widget = widgets[0];
+            bringWidgetHeaderIntoView(widget);
+            await wait(50);
+
+            const buttons = getWidgetButtons(widget);
+            const target = mode === 'incoming' ? buttons.incoming : buttons.current;
+
+            if (!target) continue;
+
+            scrollButtonFullyIntoEditorView(target);
+            await wait(25);
+
+            const ok = triggerRealClick(target);
+            if (!ok) continue;
+
+            await wait(CLICK_DELAY_MS);
+            const resolved = await monitorWidgetResolution(widget);
+            return { clicked: true, resolved };
+        }
+
+        return { clicked: false, resolved: false };
+    }
+
     async function clickVisibleConflictChoice(mode) {
         const widgets = getVisibleConflictWidgets();
         if (!widgets.length) return { clicked: false, resolved: false };
 
         const widget = widgets[0];
-        scrollElementIntoHelpfulView(widget);
 
-        const buttons = getWidgetButtons(widget);
-        const target = mode === 'incoming' ? buttons.incoming : buttons.current;
+        bringWidgetHeaderIntoView(widget);
+        await wait(40);
 
-        if (!target) return { clicked: false, resolved: false };
+        let buttons = getWidgetButtons(widget);
+        let target = mode === 'incoming' ? buttons.incoming : buttons.current;
 
-        scrollElementIntoHelpfulView(target);
+        if (!target) {
+            await clickPrevConflict();
+            await wait(60);
+            buttons = getWidgetButtons(widget);
+            target = mode === 'incoming' ? buttons.incoming : buttons.current;
+        }
 
-        const ok = triggerRealClick(target);
-        if (!ok) return { clicked: false, resolved: false };
+        if (!target) {
+            return recoverSkippedLargeConflict(mode);
+        }
+
+        scrollButtonFullyIntoEditorView(target);
+        await wait(25);
+
+        let ok = triggerRealClick(target);
+
+        if (!ok) {
+            bringWidgetHeaderIntoView(widget);
+            await wait(50);
+            scrollButtonFullyIntoEditorView(target);
+            await wait(25);
+            ok = triggerRealClick(target);
+        }
+
+        if (!ok) {
+            return recoverSkippedLargeConflict(mode);
+        }
 
         await wait(CLICK_DELAY_MS);
         const resolved = await monitorWidgetResolution(widget);
+
+        if (!resolved && getRemainingConflictCount() > 0) {
+            // If the widget did not resolve, try scanning backwards for a skipped long conflict
+            const recovered = await recoverSkippedLargeConflict(mode);
+            if (recovered.clicked) return recovered;
+        }
+
         return { clicked: true, resolved };
     }
 
     async function acceptAll(mode, fromAuto) {
         if (bulkActionRunning) return;
 
+        rememberPickedMode(mode);
         bulkActionRunning = true;
         bulkCancelRequested = false;
         stopAutoTimer();
 
         setStatus(
             fromAuto
-                ? 'Auto-accepting current…'
+                ? `Auto-accepting ${mode}…`
                 : mode === 'incoming'
                     ? 'Accepting all incoming in this file…'
                     : 'Accepting all current in this file…'
@@ -677,6 +851,20 @@
 
             if (result.clicked) {
                 clicks++;
+            } else {
+                // try next first
+                let moved = await clickNextConflict();
+                if (moved) {
+                    await wait(LOOP_DELAY_MS);
+                } else {
+                    // if next is not possible, also try previous to catch skipped long conflicts near the end
+                    moved = await clickPrevConflict();
+                    if (moved) {
+                        await wait(LOOP_DELAY_MS);
+                    } else {
+                        await wait(120);
+                    }
+                }
             }
 
             if (isMarkResolvedEnabled()) {
@@ -685,11 +873,30 @@
             }
 
             if (beforeCount <= 1 && getRemainingConflictCount() <= 1) {
+                // critical fix:
+                // when at the last visible conflict, try moving backward too,
+                // because GitHub sometimes leaves the cursor at the bottom while an earlier long conflict is still unresolved
+                const movedBack = await clickPrevConflict();
+                if (movedBack) {
+                    await wait(180);
+
+                    if (!isMarkResolvedEnabled() && getRemainingConflictCount() > 0) {
+                        const retry = await clickVisibleConflictChoice(mode);
+                        if (retry.clicked) {
+                            clicks++;
+                        }
+                    }
+                }
+
                 await wait(250);
                 if (isMarkResolvedEnabled()) {
                     setInternalRemaining(0);
                 }
-                break;
+                if (getRemainingConflictCount() <= 1 && !isMarkResolvedEnabled()) {
+                    // do not break yet if one is still left; continue loop
+                } else {
+                    break;
+                }
             }
 
             const newCount = getRemainingConflictCount();
@@ -711,12 +918,24 @@
             if (moved) {
                 await wait(LOOP_DELAY_MS);
             } else {
-                await wait(120);
+                // if next no longer moves, try previous once before declaring stuck
+                const movedBack = await clickPrevConflict();
+                if (movedBack) {
+                    await wait(LOOP_DELAY_MS);
+                } else {
+                    await wait(120);
+                }
             }
 
             if (stuckRounds >= 8) {
-                log('acceptAll stuck, breaking');
-                break;
+                // last recovery attempt: scan backward for skipped long conflict
+                const recovered = await recoverSkippedLargeConflict(mode);
+                if (!recovered.clicked) {
+                    log('acceptAll stuck, breaking');
+                    break;
+                }
+                clicks++;
+                stuckRounds = 0;
             }
         }
 
@@ -793,8 +1012,10 @@
             bulkCancelRequested = false;
             autoMarkResolvedInProgress = false;
             autoCommitInProgress = false;
+            autoContinueInProgress = false;
             lastAutoMarkResolvedKey = '';
             lastAutoCommitKey = '';
+            lastAutoContinueKey = '';
             return;
         }
 
@@ -848,6 +1069,10 @@
             setStatus('Choose how to resolve all conflicts in this file.');
             setFileStatus('Count starts from GitHub once, then updates locally.');
             if (!autoTimer && !bulkActionRunning) startAutoTimer();
+
+            if (autoContinueEnabled && !bulkActionRunning && hasPickedMode) {
+                await autoContinueSameChoiceIfWanted();
+            }
             return;
         }
 
@@ -925,8 +1150,10 @@
                 bulkCancelRequested = false;
                 autoMarkResolvedInProgress = false;
                 autoCommitInProgress = false;
+                autoContinueInProgress = false;
                 lastAutoMarkResolvedKey = '';
                 lastAutoCommitKey = '';
+                lastAutoContinueKey = '';
                 disconnectObserver();
                 queueRefresh();
                 setTimeout(queueRefresh, 300);
@@ -949,6 +1176,9 @@
                 txt === 'accept incoming change' ||
                 txt === 'accept both changes'
             ) {
+                if (txt === 'accept current change') rememberPickedMode('current');
+                if (txt === 'accept incoming change') rememberPickedMode('incoming');
+
                 const widget = btn.closest('.CodeMirror-linewidget');
                 if (widget) {
                     monitorWidgetResolution(widget);
